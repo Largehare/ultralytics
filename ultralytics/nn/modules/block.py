@@ -376,7 +376,7 @@ class MobileNetV3Block(nn.Module):
             ]
         # Depthwise convolution
         layers += [
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, kernel_size // 2, groups=hidden_dim, bias=False),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, autopad(kernel_size), groups=hidden_dim, bias=False),
             nn.BatchNorm2d(hidden_dim),
             act
         ]
@@ -401,27 +401,47 @@ class MobileNetV3Block(nn.Module):
 class Bottleneck(nn.Module):
     """Standard bottleneck modified to use MobileNetV3 blocks."""
 
-    def __init__(self, c1, c2, shortcut=True, g=1, k=3, e=0.5):
-     
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
+        """Initializes the bottleneck with MobileNetV3 blocks."""
         super(Bottleneck, self).__init__()
         expand_ratio = e
-        self.block = MobileNetV3Block(
+
+        # Handle k being a tuple of kernel sizes
+        if isinstance(k, (tuple, list)):
+            k1, k2 = k
+        else:
+            k1 = k2 = k
+
+        self.block1 = MobileNetV3Block(
             inp=c1,
-            oup=c2,
-            kernel_size=k,
-            stride=1,  # Adjust stride as needed
+            oup=int(c2 * expand_ratio),
+            kernel_size=k1,
+            stride=1,
             expand_ratio=expand_ratio,
-            use_se=True,  # Set to True to use SE block
-            activation='HS'  # Use 'HS' for h-swish or 'RE' for ReLU
+            use_se=True,
+            activation='HS'
         )
+
+        self.block2 = MobileNetV3Block(
+            inp=int(c2 * expand_ratio),
+            oup=c2,
+            kernel_size=k2,
+            stride=1,
+            expand_ratio=1.0,  # No further expansion
+            use_se=True,
+            activation='HS'
+        )
+
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
-        """Applies the MobileNetV3 block to input data."""
+        """Applies the MobileNetV3 blocks to input data."""
+        out = self.block1(x)
+        out = self.block2(out)
         if self.add:
-            return x + self.block(x)
+            return x + out
         else:
-            return self.block(x)
+            return out
 
 
 
