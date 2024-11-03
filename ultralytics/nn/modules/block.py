@@ -329,21 +329,100 @@ class GhostBottleneck(nn.Module):
         """Applies skip connection and concatenation to input tensor."""
         return self.conv(x) + self.shortcut(x)
 
+# Define h-swish activation function
+class HSwish(nn.Module):
+    def forward(self, x):
+        return x * F.relu6(x + 3) / 6
+
+# Define the SE (Squeeze-and-Excitation) block
+class SEBlock(nn.Module):
+    def __init__(self, inp, reduction=4):
+        super(SEBlock, self).__init__()
+        hidden_dim = inp // reduction
+        self.fc1 = nn.Conv2d(inp, hidden_dim, 1)
+        self.fc2 = nn.Conv2d(hidden_dim, inp, 1)
+
+    def forward(self, x):
+        y = F.adaptive_avg_pool2d(x, 1)
+        y = F.relu(self.fc1(y))
+        y = torch.sigmoid(self.fc2(y))
+        return x * y
+
+# Define the MobileNetV3 block
+class MobileNetV3Block(nn.Module):
+    def __init__(self, inp, oup, kernel_size, stride, expand_ratio, use_se, activation):
+        super(MobileNetV3Block, self).__init__()
+        self.stride = stride
+        assert stride in [1, 2]
+
+        hidden_dim = int(inp * expand_ratio)
+        self.use_res_connect = self.stride == 1 and inp == oup
+
+        # Choose activation function
+        if activation == 'HS':
+            act = HSwish()
+        elif activation == 'RE':
+            act = nn.ReLU(inplace=True)
+        else:
+            raise NotImplementedError
+
+        layers = []
+        # Expansion phase
+        if expand_ratio != 1:
+            layers += [
+                nn.Conv2d(inp, hidden_dim, 1, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                act
+            ]
+        # Depthwise convolution
+        layers += [
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, kernel_size // 2, groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            act
+        ]
+        # Squeeze-and-Excitation
+        if use_se:
+            layers.append(SEBlock(hidden_dim))
+        # Projection phase
+        layers += [
+            nn.Conv2d(hidden_dim, oup, 1, bias=False),
+            nn.BatchNorm2d(oup)
+        ]
+
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if self.use_res_connect:
+            return x + self.conv(x)
+        else:
+            return self.conv(x)
+
 
 class Bottleneck(nn.Module):
-    """Standard bottleneck."""
+    """Standard bottleneck modified to use MobileNetV3 blocks."""
 
-    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
-        """Initializes a standard bottleneck module with optional shortcut connection and configurable parameters."""
-        super().__init__()
-        c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, k[0], 1)
-        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+    def __init__(self, c1, c2, shortcut=True, g=1, k=3, e=0.5):
+     
+        super(Bottleneck, self).__init__()
+        expand_ratio = e
+        self.block = MobileNetV3Block(
+            inp=c1,
+            oup=c2,
+            kernel_size=k,
+            stride=1,  # Adjust stride as needed
+            expand_ratio=expand_ratio,
+            use_se=True,  # Set to True to use SE block
+            activation='HS'  # Use 'HS' for h-swish or 'RE' for ReLU
+        )
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
-        """Applies the YOLO FPN to input data."""
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+        """Applies the MobileNetV3 block to input data."""
+        if self.add:
+            return x + self.block(x)
+        else:
+            return self.block(x)
+
 
 
 class BottleneckCSP(nn.Module):
