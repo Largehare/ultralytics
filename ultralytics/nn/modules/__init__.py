@@ -56,6 +56,11 @@ from .block import (
     RepVGGDW,
     ResNetLayer,
     SCDown,
+    C3kGhost,
+    C3k2Ghost,
+    SqueezeExcitation,
+    MobileNetV3Block,
+    
 )
 from .conv import (
     CBAM,
@@ -156,4 +161,8 @@ __all__ = (
     "C2fCIB",
     "Attention",
     "PSA",
+    "C3kGhost",
+    "C3k2Ghost",
+    "SqueezeExcitation",
+    "MobileNetV3Block",
 )

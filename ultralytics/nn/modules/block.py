@@ -49,8 +49,12 @@ __all__ = (
     "Attention",
     "PSA",
     "SCDown",
+    
+    "C3k2Ghost", 
+    "C3kGhost",
+    "SqueezeExcitation",
+    "MobileNetV3Block",
 )
-
 
 class DFL(nn.Module):
     """
@@ -329,120 +333,21 @@ class GhostBottleneck(nn.Module):
         """Applies skip connection and concatenation to input tensor."""
         return self.conv(x) + self.shortcut(x)
 
-# Define h-swish activation function
-class HSwish(nn.Module):
-    def forward(self, x):
-        return x * F.relu6(x + 3) / 6
-
-# Define the SE (Squeeze-and-Excitation) block
-class SEBlock(nn.Module):
-    def __init__(self, inp, reduction=4):
-        super(SEBlock, self).__init__()
-        hidden_dim = inp // reduction
-        self.fc1 = nn.Conv2d(inp, hidden_dim, 1)
-        self.fc2 = nn.Conv2d(hidden_dim, inp, 1)
-
-    def forward(self, x):
-        y = F.adaptive_avg_pool2d(x, 1)
-        y = F.relu(self.fc1(y))
-        y = torch.sigmoid(self.fc2(y))
-        return x * y
-
-# Define the MobileNetV3 block
-class MobileNetV3Block(nn.Module):
-    def __init__(self, inp, oup, kernel_size, stride, expand_ratio, use_se, activation):
-        super(MobileNetV3Block, self).__init__()
-        self.stride = stride
-        assert stride in [1, 2]
-
-        hidden_dim = int(inp * expand_ratio)
-        self.use_res_connect = self.stride == 1 and inp == oup
-
-        # Choose activation function
-        if activation == 'HS':
-            act = HSwish()
-        elif activation == 'RE':
-            act = nn.ReLU(inplace=True)
-        else:
-            raise NotImplementedError
-
-        layers = []
-        # Expansion phase
-        if expand_ratio != 1:
-            layers += [
-                nn.Conv2d(inp, hidden_dim, 1, bias=False),
-                nn.BatchNorm2d(hidden_dim),
-                act
-            ]
-        # Depthwise convolution
-        layers += [
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, autopad(kernel_size), groups=hidden_dim, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            act
-        ]
-        # Squeeze-and-Excitation
-        if use_se:
-            layers.append(SEBlock(hidden_dim))
-        # Projection phase
-        layers += [
-            nn.Conv2d(hidden_dim, oup, 1, bias=False),
-            nn.BatchNorm2d(oup)
-        ]
-
-        self.conv = nn.Sequential(*layers)
-
-    def forward(self, x):
-        if self.use_res_connect:
-            return x + self.conv(x)
-        else:
-            return self.conv(x)
-
 
 class Bottleneck(nn.Module):
-    """Standard bottleneck modified to use MobileNetV3 blocks."""
+    """Standard bottleneck."""
 
     def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
-        """Initializes the bottleneck with MobileNetV3 blocks."""
-        super(Bottleneck, self).__init__()
-        expand_ratio = e
-
-        # Handle k being a tuple of kernel sizes
-        if isinstance(k, (tuple, list)):
-            k1, k2 = k
-        else:
-            k1 = k2 = k
-
-        self.block1 = MobileNetV3Block(
-            inp=c1,
-            oup=int(c2 * expand_ratio),
-            kernel_size=k1,
-            stride=1,
-            expand_ratio=expand_ratio,
-            use_se=True,
-            activation='HS'
-        )
-
-        self.block2 = MobileNetV3Block(
-            inp=int(c2 * expand_ratio),
-            oup=c2,
-            kernel_size=k2,
-            stride=1,
-            expand_ratio=1.0,  # No further expansion
-            use_se=True,
-            activation='HS'
-        )
-
+        """Initializes a standard bottleneck module with optional shortcut connection and configurable parameters."""
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
-        """Applies the MobileNetV3 blocks to input data."""
-        out = self.block1(x)
-        out = self.block2(out)
-        if self.add:
-            return x + out
-        else:
-            return out
-
+        """Applies the YOLO FPN to input data."""
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
 class BottleneckCSP(nn.Module):
@@ -1205,3 +1110,92 @@ class SCDown(nn.Module):
     def forward(self, x):
         """Applies convolution and downsampling to the input tensor in the SCDown module."""
         return self.cv2(self.cv1(x))
+
+class C3kGhost(C3k):
+    """C3 module with GhostBottleneck() and customizable kernel size.
+
+    This module uses GhostBottleneck blocks with a customizable kernel size `k`.
+    """
+
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(GhostBottleneck(c_, c_, k=k, s=1) for _ in range(n)))
+
+class C3k2Ghost(C3k2):
+    """C3k2Ghost module combining C3Ghost and C3k2 features.
+
+    This module implements a CSP bottleneck with two convolutions using GhostBottleneck blocks
+    with customizable kernel sizes.
+    """
+
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        super().__init__(c1 = c1, c2 =c2,c3k=c3k , n = n, shortcut = shortcut, g = g, e = e)
+        self.m = nn.ModuleList(
+            C3kGhost(self.c, self.c, 2, shortcut, g) if c3k else GhostBottleneck(self.c, self.c) for _ in range(n)
+        )
+
+class SqueezeExcitation(nn.Module):
+    """Squeeze-and-Excitation module."""
+
+    def __init__(self, c1, c2, reduction=4):
+        """Initialize Squeeze-and-Excitation module."""
+        super().__init__()
+        c_se = max(1, c1 // reduction)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(c1, c_se, kernel_size=1)
+        self.act1 = nn.ReLU(inplace=True)
+        self.fc2 = nn.Conv2d(c_se, c2, kernel_size=1)
+        self.act2 = nn.Hardsigmoid(inplace=True)
+
+    def forward(self, x):
+        """Forward pass through Squeeze-and-Excitation module."""
+        y = self.avg_pool(x)
+        y = self.fc1(y)
+        y = self.act1(y)
+        y = self.fc2(y)
+        y = self.act2(y)
+        return x * y
+
+class MobileNetV3Block(nn.Module):
+    """MobileNetV3 block with optional Squeeze-and-Excitation."""
+
+    def __init__(self, c1, c2, k=3, s=1, expansion=1, use_se=False, act_func='RE'):
+        """Initialize MobileNetV3 block."""
+        super().__init__()
+        self.use_res_connect = s == 1 and c1 == c2
+        c_exp = c1 * expansion
+
+        # Activation function
+        if act_func == 'RE':
+            act = nn.ReLU(inplace=True)
+        elif act_func == 'HS':
+            act = nn.Hardswish(inplace=True)
+        else:
+            raise ValueError(f"Unsupported activation function {act_func}")
+
+        layers = []
+        # 1x1 expansion
+        if expansion != 1:
+            layers.append(Conv(c1, c_exp, k=1, s=1, act=act))
+        else:
+            c_exp = c1
+        # Depthwise convolution
+        layers.append(DWConv(c_exp, c_exp, k=k, s=s, act=act))
+        # Squeeze-and-Excitation
+        if use_se:
+            layers.append(SqueezeExcitation(c_exp, c_exp))
+        # 1x1 projection
+        layers.append(Conv(c_exp, c2, k=1, s=1, act=None))
+
+        self.conv = nn.Sequential(*layers)
+        self.out_channels = c2
+        self.stride = s
+
+    def forward(self, x):
+        """Forward pass through MobileNetV3 block."""
+        out = self.conv(x)
+        if self.use_res_connect:
+            return x + out
+        else:
+            return out
